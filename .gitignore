@@ -1,0 +1,18 @@
+# secrets
+state/secrets/
+*.token
+*.json
+
+# archives & artifacts
+Email-Archive/
+*.pdf
+*.eml
+*_attachments/
+
+# runtime state
+data/ledger.sqlite3
+__pycache__/
+*.pyc
+
+# logs
+*.log
