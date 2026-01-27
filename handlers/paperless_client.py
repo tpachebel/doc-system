@@ -225,16 +225,20 @@ class PaperlessClient:
 		if not message_id:
 			return None
 
-		# tag filter: must be email-parent
+		# Must be tagged as email-parent
 		email_parent_tag_id = self.ensure_tag_id("email-parent")
 
-		# pull recent docs and match both: tag + custom field value
-		data = self.get_documents(params={"page_size": 100, "ordering": "-added"})
+		# Pull recent docs and find the one that matches:
+		# - tag email-parent
+		# - Email Message-ID == message_id
+		# - Email Is Parent == True
+		data = self.get_documents(params={"page_size": 200, "ordering": "-added"})
 		items = data.get("results", []) if isinstance(data, dict) else (data or [])
 
 		name_to_id = self._custom_field_name_to_id_map()
-		fid = name_to_id.get("email message-id")
-		if not fid:
+		fid_msgid = name_to_id.get("email message-id")
+		fid_is_parent = name_to_id.get("email is parent")
+		if not fid_msgid or not fid_is_parent:
 			return None
 
 		for d in items:
@@ -242,8 +246,49 @@ class PaperlessClient:
 			if email_parent_tag_id not in tags:
 				continue
 
+			has_msgid = False
+			has_is_parent = False
+
 			for cf in (d.get("custom_fields") or []):
-				if int(cf.get("field", -1)) == int(fid) and str(cf.get("value", "")).strip() == message_id:
-					return d
+				if int(cf.get("field", -1)) == int(fid_msgid) and str(cf.get("value", "")).strip() == message_id:
+					has_msgid = True
+
+				if int(cf.get("field", -1)) == int(fid_is_parent):
+					v = cf.get("value")
+					if v is True or str(v).strip().lower() in ("true", "1", "yes"):
+						has_is_parent = True
+
+			if has_msgid and has_is_parent:
+				return d
 
 		return None
+
+	def wait_for_task_document_id_and_status(self, task_id: str, timeout_seconds: int = 120):
+		import time
+
+		end = time.time() + timeout_seconds
+		last = None
+
+		while time.time() < end:
+			t = self.get_task(task_id)
+			last = t
+
+			if not t:
+				time.sleep(1)
+				continue
+
+			status = (t.get("status") or "").upper()
+			if status == "SUCCESS":
+				return int(t.get("related_document")), False
+
+			if status == "FAILURE":
+				# If it’s a duplicate, Paperless returns related_document of the existing doc
+				rd = t.get("related_document")
+				result = (t.get("result") or "")
+				if rd and "duplicate" in str(result).lower():
+					return int(rd), True
+				raise RuntimeError(f"Task failed: {t}")
+
+			time.sleep(1)
+
+		raise RuntimeError(f"Timeout waiting for task. Last task payload: {last}")

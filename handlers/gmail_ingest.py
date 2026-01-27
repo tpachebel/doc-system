@@ -155,6 +155,7 @@ def main():
 			"Email From": render_result.from_ or from_ or "",
 			"Email To": render_result.to or to_ or "",
 			"Email Date": email_date or "",
+			"Email Is Parent": True,
 		}
 
 		existing_parent = pl.find_email_parent_by_message_id(custom_fields.get("Email Message-ID", ""))
@@ -200,7 +201,7 @@ def main():
 				title=fname,
 			)
 
-			child_id = pl.wait_for_task_document_id(child_task_id, timeout_seconds=240)
+			child_id, was_dup = pl.wait_for_task_document_id_and_status(child_task_id, timeout_seconds=240)
 
 			# tag + custom field
 			pl.set_tags_by_name(child_id, ["email", "email-attachment"])
@@ -212,9 +213,13 @@ def main():
 				"Email To": custom_fields.get("Email To", ""),
 				"Email Subject": custom_fields.get("Email Subject", ""),
 				"Email Archive Path": custom_fields.get("Email Archive Path", ""),
+				"Email Is Parent": False,
 			})
 
-			print(f"Attachment uploaded: {fname} | child_id={child_id} | parent_id={parent_id}")
+			if was_dup:
+				print(f"Attachment reused: {fname} | child_id={child_id} | parent_id={parent_id}")
+			else:
+				print(f"Attachment uploaded: {fname} | child_id={child_id} | parent_id={parent_id}")
 
 		_remove_label(service, mid, label_id)
 		print(f"Label removed: {mid}")
