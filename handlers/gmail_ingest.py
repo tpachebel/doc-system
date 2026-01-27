@@ -34,7 +34,6 @@ def _ensure_dir(p: Path):
 
 
 def _parse_date(msg) -> tuple[str, str]:
-	# returns (date_only, iso_localish)
 	raw = msg.get("Date", "")
 	try:
 		dt = email.utils.parsedate_to_datetime(raw)
@@ -63,6 +62,15 @@ def _gmail_service():
 	return build("gmail", "v1", credentials=creds)
 
 
+def _get_gmail_account_email(service) -> str:
+	profile = service.users().getProfile(userId="me").execute()
+	addr = profile.get("emailAddress") or ""
+	addr = str(addr).strip().lower()
+	if not addr:
+		raise RuntimeError("Gmail profile did not return emailAddress")
+	return addr
+
+
 def _get_label_id(service, label_name: str) -> str:
 	labels = service.users().labels().list(userId="me").execute().get("labels", [])
 	for l in labels:
@@ -81,15 +89,14 @@ def _fetch_raw_eml(service, msg_id: str) -> bytes:
 	raw = msg["raw"]
 	return base64.urlsafe_b64decode(raw.encode("utf-8"))
 
+
 def _iter_attachments(eml_msg):
-	# yields (filename, bytes, content_type)
 	for part in eml_msg.walk():
 		if part.get_content_maintype() == "multipart":
 			continue
 
 		content_disposition = str(part.get("Content-Disposition") or "")
 		if "attachment" not in content_disposition.lower():
-			# exclude inline images etc.
 			continue
 
 		filename = part.get_filename()
@@ -104,6 +111,7 @@ def _iter_attachments(eml_msg):
 		ctype = str(part.get_content_type() or "application/octet-stream")
 		yield filename, data, ctype
 
+
 def _remove_label(service, msg_id: str, label_id: str):
 	service.users().messages().modify(
 		userId="me",
@@ -111,8 +119,11 @@ def _remove_label(service, msg_id: str, label_id: str):
 		body={"removeLabelIds": [label_id]},
 	).execute()
 
+
 def main():
 	service = _gmail_service()
+	gmail_account_email = _get_gmail_account_email(service)
+
 	label_id = _get_label_id(service, LABEL_NAME)
 	msg_ids = _list_message_ids(service, label_id, MAX_MESSAGES_PER_RUN)
 
@@ -148,8 +159,14 @@ def main():
 
 		parent_title = render_result.subject or subject or pdf_path.name
 
+		# HARD parent identity lock:
+		# composite key = "<gmail_account>::<rfc_message_id>"
+		lock = pl.find_or_lock_email_parent(gmail_account_email=gmail_account_email, rfc_message_id=(render_result.message_id or message_id or ""))
+		locked_key = lock.get("identity_key") or ""
+		existing_parent = lock.get("document")
+
 		custom_fields = {
-			"Email Message-ID": render_result.message_id or message_id or "",
+			"Email Message-ID": locked_key,
 			"Email Archive Path": (str(eml_path)[-128:]),
 			"Email Subject": render_result.subject or subject or "",
 			"Email From": render_result.from_ or from_ or "",
@@ -158,10 +175,11 @@ def main():
 			"Email Is Parent": True,
 		}
 
-		existing_parent = pl.find_email_parent_by_message_id(custom_fields.get("Email Message-ID", ""))
 		if existing_parent:
 			parent_id = int(existing_parent["id"])
-			print(f"Reusing existing email parent: parent_id={parent_id}")
+			print(f"Reusing existing email parent: parent_id={parent_id} | matched={lock.get('matched')}")
+			# Keep fields fresh (especially archive path) while preserving hard key
+			pl.set_custom_fields_by_name(parent_id, custom_fields)
 		else:
 			parent_task_id = pl.upload_document(
 				file_path=pdf_path,
@@ -180,10 +198,8 @@ def main():
 		_ensure_dir(attach_dir)
 
 		for (fname, blob, ctype) in _iter_attachments(eml):
-			# write file
 			out_path = attach_dir / fname
 			if out_path.exists():
-				# avoid overwrite collisions
 				stem = out_path.stem
 				suffix = out_path.suffix
 				i = 2
@@ -195,7 +211,6 @@ def main():
 					i += 1
 			out_path.write_bytes(blob)
 
-			# upload to Paperless (let Paperless detect mime)
 			child_task_id = pl.upload_document(
 				file_path=out_path,
 				title=fname,
@@ -203,11 +218,10 @@ def main():
 
 			child_id, was_dup = pl.wait_for_task_document_id_and_status(child_task_id, timeout_seconds=240)
 
-			# tag + custom field
 			pl.set_tags_by_name(child_id, ["email", "email-attachment"])
 			pl.set_custom_fields_by_name(child_id, {
 				"Email Parent Doc ID": parent_id,
-				"Email Message-ID": custom_fields.get("Email Message-ID", ""),
+				"Email Message-ID": locked_key,
 				"Email Date": custom_fields.get("Email Date", ""),
 				"Email From": custom_fields.get("Email From", ""),
 				"Email To": custom_fields.get("Email To", ""),
@@ -224,7 +238,6 @@ def main():
 		_remove_label(service, mid, label_id)
 		print(f"Label removed: {mid}")
 
-		# NOTE: attachment upload + pl.set_parent(child_id, parent_id) will be added next step.
 
 if __name__ == "__main__":
 	main()

@@ -1,5 +1,8 @@
-import requests
+import json
 from pathlib import Path
+from typing import Any, Optional
+
+import requests
 
 BASE_URL = "https://docs.ragheb.ca"
 TOKEN_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\secrets\paperless_token.txt")
@@ -32,7 +35,6 @@ class PaperlessClient:
 			files = {"document": (Path(file_path).name, f, "application/pdf")}
 			resp = requests.post(url, headers=self.headers, data=data, files=files)
 			resp.raise_for_status()
-			# Paperless returns a task UUID string (JSON string)
 			return resp.json()
 
 	def get_task(self, task_id: str):
@@ -52,13 +54,12 @@ class PaperlessClient:
 			t = self.get_task(task_id)
 			last = t
 			if isinstance(t, dict):
-				# common Paperless field: related_document
 				rd = t.get("related_document")
 				if isinstance(rd, int) and rd > 0:
 					return int(rd)
 				if isinstance(rd, str) and rd.strip().isdigit():
 					return int(rd.strip())
-				
+
 				r = t.get("result")
 				if isinstance(r, str):
 					import re
@@ -66,7 +67,6 @@ class PaperlessClient:
 					if m:
 						return int(m.group(1))
 
-				# fallback: some versions may nest results differently
 				res = t.get("result")
 				if isinstance(res, dict):
 					if "document_id" in res:
@@ -74,10 +74,8 @@ class PaperlessClient:
 					if "related_document" in res:
 						return int(res["related_document"])
 
-				# if it explicitly failed, stop early
 				status = str(t.get("status") or "").upper()
 				if status in ("FAILURE", "FAILED", "ERROR"):
-					# Paperless duplicate handling: treat as success if it tells us the existing doc id.
 					rd = t.get("related_document")
 					if isinstance(rd, int) and rd > 0:
 						return int(rd)
@@ -157,7 +155,6 @@ class PaperlessClient:
 		if not name:
 			raise ValueError("Tag name is empty")
 
-		# Try filtered lookup first (Paperless often returns paginated dict or list depending on version)
 		data = self.list_tags(name=name)
 		if isinstance(data, dict) and "results" in data:
 			for t in data["results"]:
@@ -168,7 +165,6 @@ class PaperlessClient:
 				if str(t.get("name", "")).lower() == name.lower():
 					return int(t["id"])
 
-		# Fallback: create
 		created = self.create_tag(name)
 		return int(created["id"])
 
@@ -185,15 +181,12 @@ class PaperlessClient:
 		resp = requests.patch(url, headers={**self.headers, "Content-Type": "application/json"}, json=payload)
 		resp.raise_for_status()
 		return resp.json()
-	
+
 	def find_document_by_custom_field(self, field_name: str, exact_value: str):
-		# Best-effort search: fetch recent docs and match on custom_fields content.
-		# (Paperless search API is version-dependent; this is deterministic.)
 		exact_value = (exact_value or "").strip()
 		if not exact_value:
 			return None
 
-		# Pull recent docs (increase if needed later)
 		data = self.get_documents(params={"page_size": 50, "ordering": "-added"})
 		items = []
 		if isinstance(data, dict) and "results" in data:
@@ -201,37 +194,71 @@ class PaperlessClient:
 		elif isinstance(data, list):
 			items = data
 
-		target = exact_value
-		for d in items:
-			cfs = d.get("custom_fields") or []
-			for cf in cfs:
-				if str(cf.get("field")) == str(cf.get("field")):
-					# we match by name later; easiest is to fetch field map once
-					pass
-		# Use proper field id mapping:
 		name_to_id = self._custom_field_name_to_id_map()
 		fid = name_to_id.get((field_name or "").strip().lower())
 		if not fid:
 			return None
 
+		target = exact_value
 		for d in items:
 			for cf in (d.get("custom_fields") or []):
 				if int(cf.get("field", -1)) == int(fid) and str(cf.get("value", "")).strip() == target:
 					return d
 		return None
 
+	def find_document_by_custom_field_exact(self, field_name: str, exact_value: str) -> Optional[dict]:
+		exact_value = (exact_value or "").strip()
+		if not exact_value:
+			return None
+
+		params = {
+			"custom_field_query": json.dumps([field_name, "exact", exact_value]),
+			"page_size": 1
+		}
+
+		url = f"{self.base_url}/api/documents/"
+		try:
+			resp = requests.get(url, headers=self.headers, params=params)
+			if resp.status_code == 400:
+				return self.find_document_by_custom_field(field_name, exact_value)
+			resp.raise_for_status()
+			data = resp.json()
+			items = data.get("results", []) if isinstance(data, dict) else (data or [])
+			if items:
+				return items[0]
+			return None
+		except requests.RequestException:
+			return self.find_document_by_custom_field(field_name, exact_value)
+
+	def build_email_identity_key(self, gmail_account_email: str, rfc_message_id: str) -> str:
+		return f"{(gmail_account_email or '').strip().lower()}::{(rfc_message_id or '').strip()}"
+
+	def find_or_lock_email_parent(self, gmail_account_email: str, rfc_message_id: str) -> dict[str, Any]:
+		rfc_message_id = (rfc_message_id or "").strip()
+		if not rfc_message_id:
+			return {"document": None, "identity_key": None, "matched": "none"}
+
+		identity_key = self.build_email_identity_key(gmail_account_email, rfc_message_id)
+
+		d = self.find_document_by_custom_field_exact("Email Message-ID", identity_key)
+		if d:
+			return {"document": d, "identity_key": identity_key, "matched": "composite"}
+
+		legacy = self.find_document_by_custom_field_exact("Email Message-ID", rfc_message_id)
+		if legacy:
+			self.set_custom_fields_by_name(int(legacy["id"]), {"Email Message-ID": identity_key})
+			legacy = self.get_document(int(legacy["id"]))
+			return {"document": legacy, "identity_key": identity_key, "matched": "legacy"}
+
+		return {"document": None, "identity_key": identity_key, "matched": "none"}
+
 	def find_email_parent_by_message_id(self, message_id: str):
 		message_id = (message_id or "").strip()
 		if not message_id:
 			return None
 
-		# Must be tagged as email-parent
 		email_parent_tag_id = self.ensure_tag_id("email-parent")
 
-		# Pull recent docs and find the one that matches:
-		# - tag email-parent
-		# - Email Message-ID == message_id
-		# - Email Is Parent == True
 		data = self.get_documents(params={"page_size": 200, "ordering": "-added"})
 		items = data.get("results", []) if isinstance(data, dict) else (data or [])
 
@@ -282,7 +309,6 @@ class PaperlessClient:
 				return int(t.get("related_document")), False
 
 			if status == "FAILURE":
-				# If it’s a duplicate, Paperless returns related_document of the existing doc
 				rd = t.get("related_document")
 				result = (t.get("result") or "")
 				if rd and "duplicate" in str(result).lower():
