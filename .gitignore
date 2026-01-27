@@ -20,3 +20,6 @@ __pycache__/
 handlers/gmail_ingest.py.bak
 handlers/paperless_client.py.bak
 
+
+state/attachment_dedupe.sqlite3
+

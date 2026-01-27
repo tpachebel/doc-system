@@ -115,6 +115,29 @@ class PaperlessClient:
 				m[name.lower()] = int(cf["id"])
 		return m
 
+	def create_custom_field(self, name: str, data_type: str = "string"):
+		name = (name or "").strip()
+		if not name:
+			raise ValueError("Custom field name is empty")
+
+		url = f"{self.base_url}/api/custom_fields/"
+		payload = {
+			"name": name,
+			"data_type": data_type,
+			"extra_data": {"select_options": [], "default_currency": None},
+		}
+		resp = requests.post(url, headers={**self.headers, "Content-Type": "application/json"}, json=payload)
+		resp.raise_for_status()
+		return resp.json()
+
+	def ensure_custom_field(self, name: str, data_type: str = "string") -> int:
+		name_to_id = self._custom_field_name_to_id_map()
+		existing = name_to_id.get((name or "").strip().lower())
+		if existing:
+			return int(existing)
+		created = self.create_custom_field(name=name, data_type=data_type)
+		return int(created["id"])
+
 	def set_custom_fields_by_name(self, doc_id: int, values_by_name: dict):
 		name_to_id = self._custom_field_name_to_id_map()
 		items = []
@@ -251,44 +274,6 @@ class PaperlessClient:
 			return {"document": legacy, "identity_key": identity_key, "matched": "legacy"}
 
 		return {"document": None, "identity_key": identity_key, "matched": "none"}
-
-	def find_email_parent_by_message_id(self, message_id: str):
-		message_id = (message_id or "").strip()
-		if not message_id:
-			return None
-
-		email_parent_tag_id = self.ensure_tag_id("email-parent")
-
-		data = self.get_documents(params={"page_size": 200, "ordering": "-added"})
-		items = data.get("results", []) if isinstance(data, dict) else (data or [])
-
-		name_to_id = self._custom_field_name_to_id_map()
-		fid_msgid = name_to_id.get("email message-id")
-		fid_is_parent = name_to_id.get("email is parent")
-		if not fid_msgid or not fid_is_parent:
-			return None
-
-		for d in items:
-			tags = d.get("tags") or []
-			if email_parent_tag_id not in tags:
-				continue
-
-			has_msgid = False
-			has_is_parent = False
-
-			for cf in (d.get("custom_fields") or []):
-				if int(cf.get("field", -1)) == int(fid_msgid) and str(cf.get("value", "")).strip() == message_id:
-					has_msgid = True
-
-				if int(cf.get("field", -1)) == int(fid_is_parent):
-					v = cf.get("value")
-					if v is True or str(v).strip().lower() in ("true", "1", "yes"):
-						has_is_parent = True
-
-			if has_msgid and has_is_parent:
-				return d
-
-		return None
 
 	def wait_for_task_document_id_and_status(self, task_id: str, timeout_seconds: int = 120):
 		import time
