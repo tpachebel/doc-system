@@ -19,10 +19,11 @@ __pycache__/
 
 handlers/gmail_ingest.py.bak
 handlers/paperless_client.py.bak
-
-
 state/attachment_dedupe.sqlite3
-
-
 state/ingest_events.jsonl
 
+handlers_backup_before_patch/
+handlers_backup_before_patch_v2/
+state/events/*.jsonl
+state/events/*.json
+state/events/*.log
