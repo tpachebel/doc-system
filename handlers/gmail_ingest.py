@@ -7,7 +7,8 @@ import email
 import re
 import hashlib
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from email.policy import default
 
 from google.oauth2.credentials import Credentials
@@ -15,11 +16,18 @@ from googleapiclient.discovery import build
 
 from handlers.paperless_client import PaperlessClient
 from handlers.email_render import render_email_pdf
+from handlers.event_log import EventLog
+
 from handlers.gmail_config import SCOPES, TOKEN_PATH, LABEL_NAME, MAX_MESSAGES_PER_RUN
 
 
 EMAIL_ARCHIVE_ROOT = Path(r"C:\Users\tragh\Nextcloud\DocSystem\Email-Archive")
 ATTACH_DB = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\attachment_dedupe.sqlite3")
+EVENT_LOG_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\ingest_events.jsonl")
+
+
+def _utc_now_iso() -> str:
+	return datetime.now(timezone.utc).isoformat()
 
 
 def _sha256(data: bytes) -> str:
@@ -122,13 +130,15 @@ def _remove_label(service, msg_id: str, label_id: str):
 	).execute()
 
 
+def _paperless_doc_exists(pl: PaperlessClient, doc_id: int) -> bool:
+	try:
+		pl.get_document(int(doc_id))
+		return True
+	except Exception:
+		return False
+
+
 def _find_existing_attachment_legacy(pl: PaperlessClient, locked_key: str, fname: str, email_date: str) -> int | None:
-	# Legacy fallback for already-ingested attachments that do not yet have SHA field populated.
-	# We match:
-	# - Email Message-ID == locked_key
-	# - Email Is Parent == False
-	# - (optional) Email Date == email_date (if available)
-	# Then pick best candidate by title/original filename heuristics.
 	locked_key = (locked_key or "").strip()
 	fname_norm = (fname or "").strip().lower()
 	if not locked_key or not fname_norm:
@@ -206,134 +216,246 @@ def main():
 		return
 
 	pl = PaperlessClient()
+	log = EventLog(EVENT_LOG_PATH)
 
 	db = sqlite3.connect(ATTACH_DB)
 	db.execute("PRAGMA journal_mode=WAL")
 	cur = db.cursor()
 
-	for mid in msg_ids:
-		raw_eml = _fetch_raw_eml(service, mid)
-		eml = email.message_from_bytes(raw_eml, policy=default)
+	for gmail_mid in msg_ids:
+		if log.has_ingest_completed(gmail_account_email, gmail_mid):
+			try:
+				_remove_label(service, gmail_mid, label_id)
+				if not log.has_label_removed(gmail_account_email, gmail_mid):
+					log.append({
+						"event_type": "label_removed",
+						"ts_utc": _utc_now_iso(),
+						"gmail_account": gmail_account_email,
+						"gmail_message_id": gmail_mid,
+						"note": "late_remove_after_skip",
+					})
+				print(f"Label removed (skip-path): {gmail_mid}")
+			except Exception as e:
+				log.append({
+					"event_type": "label_remove_failed",
+					"ts_utc": _utc_now_iso(),
+					"gmail_account": gmail_account_email,
+					"gmail_message_id": gmail_mid,
+					"error": repr(e),
+					"note": "skip_path",
+				})
+			print(f"Skipped already-ingested message: {gmail_mid}")
+			continue
 
-		message_id = _get_header(eml, "Message-ID")
-		subject = _get_header(eml, "Subject")
-		from_ = _get_header(eml, "From")
-		to_ = _get_header(eml, "To")
-		email_date, email_datetime = _parse_date(eml)
+		event_id = str(uuid.uuid4())
+		attachments_events = []
+		parent_event = {}
+		email_meta = {}
 
-		safe_id = _safe_msgid(message_id)
-		year = email_datetime[0:4] if email_datetime else datetime.now().strftime("%Y")
-		month = email_datetime[5:7] if email_datetime else datetime.now().strftime("%m")
+		try:
+			raw_eml = _fetch_raw_eml(service, gmail_mid)
+			eml = email.message_from_bytes(raw_eml, policy=default)
 
-		archive_dir = EMAIL_ARCHIVE_ROOT / year / month
-		_ensure_dir(archive_dir)
+			message_id = _get_header(eml, "Message-ID").strip()
+			subject = _get_header(eml, "Subject")
+			from_ = _get_header(eml, "From")
+			to_ = _get_header(eml, "To")
+			email_date, email_datetime = _parse_date(eml)
 
-		eml_path = archive_dir / f"{safe_id}.eml"
-		if not eml_path.exists():
-			eml_path.write_bytes(raw_eml)
+			email_meta = {
+				"rfc_message_id": message_id.strip(),
+				"subject": subject,
+				"from": from_,
+				"to": to_,
+				"email_date": email_date,
+			}
 
-		pdf_path = archive_dir / f"{safe_id}.pdf"
-		render_result = render_email_pdf(eml_path, pdf_path)
+			safe_id = _safe_msgid(message_id)
+			year = email_datetime[0:4] if email_datetime else datetime.now().strftime("%Y")
+			month = email_datetime[5:7] if email_datetime else datetime.now().strftime("%m")
 
-		parent_title = render_result.subject or subject or pdf_path.name
+			archive_dir = EMAIL_ARCHIVE_ROOT / year / month
+			_ensure_dir(archive_dir)
 
-		lock = pl.find_or_lock_email_parent(gmail_account_email=gmail_account_email, rfc_message_id=(render_result.message_id or message_id or ""))
-		locked_key = lock.get("identity_key") or ""
-		existing_parent = lock.get("document")
+			eml_path = archive_dir / f"{safe_id}.eml"
+			if not eml_path.exists():
+				eml_path.write_bytes(raw_eml)
 
-		parent_fields = {
-			"Email Message-ID": locked_key,
-			"Email Archive Path": (str(eml_path)[-128:]),
-			"Email Subject": render_result.subject or subject or "",
-			"Email From": render_result.from_ or from_ or "",
-			"Email To": render_result.to or to_ or "",
-			"Email Date": email_date or "",
-			"Email Is Parent": True,
-		}
+			pdf_path = archive_dir / f"{safe_id}.pdf"
+			render_result = render_email_pdf(eml_path, pdf_path)
+			parent_title = render_result.subject or subject or pdf_path.name
 
-		if existing_parent:
-			parent_id = int(existing_parent["id"])
-		else:
-			parent_task_id = pl.upload_document(file_path=pdf_path, title=parent_title)
-			parent_id = pl.wait_for_task_document_id(parent_task_id, timeout_seconds=240)
-			pl.set_tags_by_name(parent_id, ["email", "email-parent"])
+			lock = pl.find_or_lock_email_parent(
+				gmail_account_email=gmail_account_email,
+				rfc_message_id=(render_result.message_id or message_id or ""),
+			)
+			locked_key = lock.get("identity_key") or ""
+			existing_parent = lock.get("document")
+			parent_matched = lock.get("matched")
 
-		pl.set_custom_fields_by_name(parent_id, parent_fields)
-
-		attach_dir = archive_dir / f"{safe_id}_attachments"
-		_ensure_dir(attach_dir)
-
-		for (fname, blob) in _iter_attachments(eml):
-			h = _sha256(blob)
-
-			row = cur.execute("SELECT document_id FROM attachment_hash WHERE sha256=?", (h,)).fetchone()
-			if row:
-				doc_id = int(row[0])
-				print(f"Attachment reused (sqlite): {fname} -> doc {doc_id}")
-				continue
-
-			existing = pl.find_document_by_custom_field_exact("Email Attachment SHA256", h)
-			if existing:
-				doc_id = int(existing["id"])
-				cur.execute(
-					"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
-					(h, doc_id),
-				)
-				print(f"Attachment reused (paperless-hash): {fname} -> doc {doc_id}")
-				continue
-
-			legacy_doc_id = _find_existing_attachment_legacy(pl, locked_key, fname, email_date)
-			if legacy_doc_id:
-				# Backfill SHA into Paperless + sqlite for future deterministic dedupe
-				pl.set_custom_fields_by_name(legacy_doc_id, {"Email Attachment SHA256": h})
-				cur.execute(
-					"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
-					(h, legacy_doc_id),
-				)
-				print(f"Attachment reused (legacy-match): {fname} -> doc {legacy_doc_id}")
-				continue
-
-			out_path = attach_dir / fname
-			if out_path.exists():
-				stem = out_path.stem
-				suffix = out_path.suffix
-				i = 2
-				while True:
-					cand = attach_dir / f"{stem}__{i}{suffix}"
-					if not cand.exists():
-						out_path = cand
-						break
-					i += 1
-			out_path.write_bytes(blob)
-
-			child_task_id = pl.upload_document(file_path=out_path, title=fname)
-			child_id, was_dup = pl.wait_for_task_document_id_and_status(child_task_id, timeout_seconds=240)
-
-			pl.set_tags_by_name(child_id, ["email", "email-attachment"])
-			pl.set_custom_fields_by_name(child_id, {
-				"Email Parent Doc ID": parent_id,
+			parent_fields = {
 				"Email Message-ID": locked_key,
-				"Email Attachment SHA256": h,
-				"Email Date": parent_fields.get("Email Date", ""),
-				"Email From": parent_fields.get("Email From", ""),
-				"Email To": parent_fields.get("Email To", ""),
-				"Email Subject": parent_fields.get("Email Subject", ""),
-				"Email Archive Path": parent_fields.get("Email Archive Path", ""),
-				"Email Is Parent": False,
+				"Email Archive Path": (str(eml_path)[-128:]),
+				"Email Subject": render_result.subject or subject or "",
+				"Email From": render_result.from_ or from_ or "",
+				"Email To": render_result.to or to_ or "",
+				"Email Date": email_date or "",
+				"Email Is Parent": True,
+			}
+
+			if existing_parent:
+				parent_id = int(existing_parent["id"])
+				parent_action = "reused"
+			else:
+				parent_task_id = pl.upload_document(file_path=pdf_path, title=parent_title)
+				parent_id = pl.wait_for_task_document_id(parent_task_id, timeout_seconds=240)
+				pl.set_tags_by_name(parent_id, ["email", "email-parent"])
+				parent_action = "uploaded"
+
+			pl.set_custom_fields_by_name(parent_id, parent_fields)
+
+			parent_event = {
+				"parent_doc_id": parent_id,
+				"parent_identity_key": locked_key,
+				"parent_action": parent_action,
+				"parent_match": parent_matched,
+				"archive_eml": str(eml_path),
+				"archive_pdf": str(pdf_path),
+			}
+
+			attach_dir = archive_dir / f"{safe_id}_attachments"
+			_ensure_dir(attach_dir)
+
+			for (fname, blob) in _iter_attachments(eml):
+				h = _sha256(blob)
+
+				row = cur.execute("SELECT document_id FROM attachment_hash WHERE sha256=?", (h,)).fetchone()
+				if row:
+					doc_id = int(row[0])
+					if _paperless_doc_exists(pl, doc_id):
+						attachments_events.append({
+							"filename": fname,
+							"sha256": h,
+							"doc_id": doc_id,
+							"action": "reused_sqlite",
+						})
+						print(f"Attachment reused (sqlite): {fname} -> doc {doc_id}")
+						continue
+
+					cur.execute("DELETE FROM attachment_hash WHERE sha256=?", (h,))
+					print(f"Attachment stale (sqlite purged): {fname} -> missing doc {doc_id}")
+
+				existing = pl.find_document_by_custom_field_exact("Email Attachment SHA256", h)
+				if existing:
+					doc_id = int(existing["id"])
+					cur.execute(
+						"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
+						(h, doc_id),
+					)
+					attachments_events.append({
+						"filename": fname,
+						"sha256": h,
+						"doc_id": doc_id,
+						"action": "reused_paperless_hash",
+					})
+					print(f"Attachment reused (paperless-hash): {fname} -> doc {doc_id}")
+					continue
+
+				legacy_doc_id = _find_existing_attachment_legacy(pl, locked_key, fname, email_date)
+				if legacy_doc_id:
+					pl.set_custom_fields_by_name(legacy_doc_id, {"Email Attachment SHA256": h})
+					cur.execute(
+						"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
+						(h, legacy_doc_id),
+					)
+					attachments_events.append({
+						"filename": fname,
+						"sha256": h,
+						"doc_id": legacy_doc_id,
+						"action": "reused_legacy_match",
+					})
+					print(f"Attachment reused (legacy-match): {fname} -> doc {legacy_doc_id}")
+					continue
+
+				out_path = attach_dir / fname
+				if out_path.exists():
+					stem = out_path.stem
+					suffix = out_path.suffix
+					i = 2
+					while True:
+						cand = attach_dir / f"{stem}__{i}{suffix}"
+						if not cand.exists():
+							out_path = cand
+							break
+						i += 1
+				out_path.write_bytes(blob)
+
+				child_task_id = pl.upload_document(file_path=out_path, title=fname)
+				child_id, was_dup = pl.wait_for_task_document_id_and_status(child_task_id, timeout_seconds=240)
+
+				pl.set_tags_by_name(child_id, ["email", "email-attachment"])
+				pl.set_custom_fields_by_name(child_id, {
+					"Email Parent Doc ID": parent_id,
+					"Email Message-ID": locked_key,
+					"Email Attachment SHA256": h,
+					"Email Date": parent_fields.get("Email Date", ""),
+					"Email From": parent_fields.get("Email From", ""),
+					"Email To": parent_fields.get("Email To", ""),
+					"Email Subject": parent_fields.get("Email Subject", ""),
+					"Email Archive Path": parent_fields.get("Email Archive Path", ""),
+					"Email Is Parent": False,
+				})
+
+				cur.execute(
+					"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
+					(h, int(child_id)),
+				)
+
+				action = "reused_paperless_dup" if was_dup else "uploaded"
+				attachments_events.append({
+					"filename": fname,
+					"sha256": h,
+					"doc_id": int(child_id),
+					"action": action,
+				})
+				print(f"Attachment {action}: {fname} -> doc {child_id}")
+
+			db.commit()
+
+			log.append({
+				"event_type": "ingest_completed",
+				"event_id": event_id,
+				"ts_utc": _utc_now_iso(),
+				"gmail_account": gmail_account_email,
+				"gmail_message_id": gmail_mid,
+				**email_meta,
+				**parent_event,
+				"attachments": attachments_events,
 			})
 
-			cur.execute(
-				"INSERT OR IGNORE INTO attachment_hash (sha256, document_id) VALUES (?,?)",
-				(h, int(child_id)),
-			)
+			_remove_label(service, gmail_mid, label_id)
+			log.append({
+				"event_type": "label_removed",
+				"event_id": event_id,
+				"ts_utc": _utc_now_iso(),
+				"gmail_account": gmail_account_email,
+				"gmail_message_id": gmail_mid,
+			})
+			print(f"Label removed: {gmail_mid}")
 
-			if was_dup:
-				print(f"Attachment reused (paperless-dup): {fname} -> doc {child_id}")
-			else:
-				print(f"Attachment uploaded: {fname} -> doc {child_id}")
-
-		db.commit()
-		_remove_label(service, mid, label_id)
+		except Exception as e:
+			log.append({
+				"event_type": "ingest_failed",
+				"event_id": event_id,
+				"ts_utc": _utc_now_iso(),
+				"gmail_account": gmail_account_email,
+				"gmail_message_id": gmail_mid,
+				"error": repr(e),
+				**email_meta,
+				**parent_event,
+				"attachments": attachments_events,
+			})
+			raise
 
 	db.commit()
 	db.close()
