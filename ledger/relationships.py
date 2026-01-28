@@ -1,5 +1,9 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def utcnow():
+	return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def upsert_relationship(
@@ -12,7 +16,7 @@ def upsert_relationship(
 	dst_id,
 	created_by,
 ):
-	now = datetime.utcnow().isoformat() + "Z"
+	now = utcnow()
 	rid = str(uuid.uuid4())
 
 	db.con.execute(
