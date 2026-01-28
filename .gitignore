@@ -27,3 +27,6 @@ handlers_backup_before_patch_v2/
 state/events/*.jsonl
 state/events/*.json
 state/events/*.log
+docs/
+scripts/print_folders_tree.py
+migrations/0032_1_transactions.sql
