@@ -40,7 +40,7 @@ def load_existing_sidecar(path: Path) -> dict | None:
                 return None
 
 
-def merge_sidecar(existing: dict | None, *, doc: dict, rels: list[dict]) -> dict:
+def merge_sidecar(existing: dict | None, *, doc: dict, rels: list[dict], docs_by_id: dict[str, dict]) -> dict:
         document_id = doc["document_id"]
 
         outgoing = [r for r in rels if r["src_id"] == document_id and r["src_type"] == "document"]
@@ -51,12 +51,34 @@ def merge_sidecar(existing: dict | None, *, doc: dict, rels: list[dict]) -> dict
         base["schema_version"] = base.get("schema_version", 1)
         base["document_id"] = document_id
         base["kind"] = doc.get("kind", "unknown")
+        base["entity_id"] = doc.get("entity_id")
         base["sources"] = {
                 "source_type": doc.get("source_type", "unknown"),
                 "source_locator": doc.get("source_locator", ""),
         }
 
-        # Phase 3.2.3: derived/cached fields only
+        candidates = []
+        if base["kind"] == "attachment":
+                for r in incoming:
+                        if r["relationship_type"] != "parent_of":
+                                continue
+                        if r["src_type"] != "document":
+                                continue
+                        parent = docs_by_id.get(r["src_id"])
+                        if not parent:
+                                continue
+                        if parent.get("kind") != "email_body":
+                                continue
+                        if parent.get("entity_id"):
+                                candidates.append(
+                                        {
+                                                "entity_id": parent["entity_id"],
+                                                "reason": "parent",
+                                                "confidence": 0.7,
+                                                "parent_document_id": parent["document_id"],
+                                        }
+                                )
+
         base["cached"] = {
                 "backfilled_at": utcnow(),
                 "relationships": {
@@ -81,6 +103,7 @@ def merge_sidecar(existing: dict | None, *, doc: dict, rels: list[dict]) -> dict
                                 for r in incoming
                         ],
                 },
+                "entity_candidates": sorted(candidates, key=lambda x: (x["entity_id"], x["parent_document_id"])),
         }
 
         return base
@@ -97,12 +120,13 @@ def main():
 
         DOCS_DIR.mkdir(parents=True, exist_ok=True)
         live_ids = {d["document_id"] for d in docs}
+        docs_by_id = {d["document_id"]: d for d in docs}
 
         wrote = 0
         for d in docs:
                 path = DOCS_DIR / f"{d['document_id']}.json"
                 existing = load_existing_sidecar(path)
-                merged = merge_sidecar(existing, doc=d, rels=rels)
+                merged = merge_sidecar(existing, doc=d, rels=rels, docs_by_id=docs_by_id)
                 path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 wrote += 1
 
