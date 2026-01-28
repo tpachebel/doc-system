@@ -23,3 +23,6 @@ handlers/paperless_client.py.bak
 
 state/attachment_dedupe.sqlite3
 
+
+state/ingest_events.jsonl
+
