@@ -1,435 +1,544 @@
 # DocSystem
 
-Local-first document, email, ledger, reporting, and automation system.
+**Local-first document, transaction, and automation system**  
+Deterministic • Auditable • Future-proof
 
-This repository is the **authoritative definition** of how DocSystem is designed, built, and extended.
-All development must follow this document.
+This repository is the **authoritative specification** for DocSystem.  
+All implementation **must conform to this document**.
 
 ---
 
 ## 1. Core Objective
 
-Build a **deterministic, auditable, future-proof** system that:
+Build a system that:
 
-- Ingests documents, emails, attachments, CSVs, scans
-- Extracts structured financial and contextual data
-- Maintains a **local source of truth**
-- Uses Paperless only as a document UI
-- Generates real-time XLSX financial reports
-- Supports future unknown requirements without redesign
+- Ingests documents, emails, attachments, scans, CSVs, and feeds
+
+- Extracts structured facts with confidence and evidence
+
+- Maintains a **local, regenerable source of truth**
+
+- Treats Paperless as a **consumer UI only**
+
+- Produces deterministic financial reports
+
 - Enables high-confidence querying and automation
-- Runs quietly in the background with adaptive priority
+
+- Survives future changes in thinking without redesign
 
 ---
 
 ## 2. Architectural Principle
 
-> **Paperless is a consumer UI, not the source of truth.**
+> **Paperless is a UI.  
+> DocSystem is the source of truth.**
 
-The system state lives locally and can be:
-- regenerated
+All meaning lives locally and can be:
+
+- re-extracted
+
 - reinterpreted
+
+- re-linked
+
 - re-reported
-without re-ingesting raw data.
+
+without re-ingesting raw inputs.
 
 ---
 
-## 3. Folder Structure (Authoritative)
+## 3. Authoritative Folder Structure
 
-DocSystem/
-├── README.md ← this file
-├── data/
-│ └── ledger.sqlite3 ← authoritative structured state
-├── state/
-│ ├── events/ ← append-only JSONL event log
-│ ├── docs/ ← document sidecars
-│ ├── txns/ ← transaction sidecars
-│ ├── profiles/ ← import profiles (JSON)
-│ └── secrets/
-│ ├── ha_token.txt
-│ ├── paperless_token.txt
-│ └── gmail/
-│ ├── client_secret.json
-│ └── token.json
-├── handlers/ ← ingestion & integration plugins
-├── policies/ ← policy engines (FX, allocation, etc.)
-├── reports/ ← report definitions
-├── outputs/ ← generated XLSX files
-├── Email-Archive/ ← archived raw .eml files (YYYY/MM/)
+DocSystem/ 
 
+├── README.md                     ← this file 
 
-All folders under `DocSystem` are synced via Nextcloud for real-time backup.
+├── data/ 
+
+│   └── ledger.sqlite3            ← authoritative structured state 
+
+├── state/ 
+
+│   ├── events/               ← append-only JSONL event log 
+
+│   ├── docs/                 ← document sidecars 
+
+│   ├── txns/                 ← transaction sidecars 
+
+│   ├── profiles/             ← import/source profiles 
+
+│   └── secrets/ 
+
+│       ├── ha_token.txt 
+
+│       ├── paperless_token.txt 
+
+│       └── gmail/ 
+
+│           ├── client_secret.json 
+
+│           └── token.json 
+
+├── handlers/                 ← ingestion plugins 
+
+├── policies/                 ← policy engines (future) 
+
+├── reports/                  ← report definitions 
+
+├── outputs/                  ← generated XLSX outputs 
+
+├── Email-Archive/            ← archived raw .eml (YYYY/MM/)
+
+All folders are synced via Nextcloud.
 
 ---
 
 ## 4. Source Types (Expandable)
 
-Current:
+**Current**
+
 - Scanner → folder
+
 - Gmail via API
+
 - Manual file drops
 
-Future:
-- CSV exports (banks, services)
+**Future**
+
+- CSV exports
+
+- Financial feeds (e.g. SimpleFin)
+
 - APIs
-- Other email providers
+
 - Bulk historical imports
 
 **Rule:**  
 Each source is implemented as a **handler plugin**.  
-Core logic is never modified for new sources.
+Core logic is never modified to add sources.
 
 ---
 
 ## 5. Ingestion Layer
 
 Responsibilities:
+
 - Detect new input
-- Identify source type
+
+- Identify source
+
 - Archive raw originals
-- Emit structured ingestion events
+
+- Emit ingestion events
 
 Guarantees:
+
 - Raw inputs are never lost
+
 - Re-ingestion is idempotent
+
 - Failures are logged and retryable
 
-Example (Email):
-- Raw `.eml` archived to `Email-Archive/YYYY/MM/`
-- Event written to `state/events/ingest_events.jsonl`
+---
+
+## 6. Document Model (Phase 3.1 — LOCKED)
+
+### 6.1 Document Identity
+
+Each document has:
+
+- `document_id` (stable, internal)
+
+- `source_fingerprint` (dedup detection)
+
+- `kind` (what it fundamentally is)
+
+- `roles[]` (how it can be used)
+
+- `entity_id` (nullable)
+
+- `entity_candidates[]` (optional)
+
+Examples of `kind`:
+
+- email_body
+
+- attachment
+
+- scan
+
+- photo
+
+- receipt
+
+- lease
+
+- bank_statement
+
+- csv
+
+- reference
+
+Examples of `roles`:
+
+- financial
+
+- legal
+
+- evidence
+
+- personal
+
+- warranty
+
+- medical
+
+Unknown entity is explicitly allowed.
 
 ---
 
-## 6. Normalization & Extraction
+### 6.2 Document Sidecars
+
+Each document produces a sidecar at:
+
+`state/docs/<document_id>.json`
+
+Sidecars contain **facts, not decisions**.
+
+They may include:
+
+- extracted fields
+
+- clauses
+
+- line items
+
+- normalized text
+
+- structured JSON
+
+- OCR outputs
+
+Each extracted element stores:
+
+- value
+
+- confidence
+
+- evidence (page, snippet, bounding box if available)
+
+Sidecars are:
+
+- versioned
+
+- append-only
+
+- regenerable
+
+---
+
+### 6.3 Relationships (Critical)
+
+Relationships are **first-class, many-to-many, polymorphic records**.
+
+They may link:
+
+- document ↔ document
+
+- document ↔ entity
+
+- document ↔ property
+
+- document ↔ unit
+
+- document ↔ transaction
+
+- document ↔ policy reference
+
+A document may have **unlimited relationships**.
+
+Relationship types are generic:
+
+- `parent_of`
+
+- `derived_from`
+
+- `evidence_for`
+
+- `covers`
+
+- `applies_to`
+
+- `related_to`
+
+No business logic is encoded in relationship names.
+
+---
+
+## 7. Normalization & Extraction
 
 Responsibilities:
+
 - OCR (if required)
+
 - Text normalization
-- Structure recovery (tables, ordering)
-- Key:value extraction
+
+- Structure recovery
+
+- Key/value extraction
+
 - Currency detection
+
 - Confidence scoring
 
-Output:
-- Normalized text
-- Structured JSON
-- Extracted transactions
-- Confidence metadata
-
 **Rule:**  
-Extraction produces **facts + confidence**, never assumptions.
+Extraction produces **facts + confidence + evidence**, never assumptions.
 
 ---
 
-## 7. State Layer (Source of Truth)
+## 8. State Layer (Source of Truth)
 
 Stored in:
+
 - `data/ledger.sqlite3`
-- `state/*.jsonl` mirrors (append-only)
+
+- `state/*.jsonl` mirrors
 
 Contains:
+
 - Documents
+
 - Transactions
+
 - Entities
+
 - Properties
-- Accounts
-- Allocations
-- FX decisions
+
+- Units
+
+- Relationships
+
 - Events
+
 - Corrections
-- Policy applications
 
 Guarantees:
-- Every number is traceable to a document
+
+- Every number is traceable
+
 - Every change is auditable
-- Past data can be reinterpreted without re-ingestion
+
+- Past data can be reinterpreted
 
 ---
 
-## 8. Paperless Integration
+## 9. Paperless Integration
 
 Purpose:
-- Human browsing
+
+- Browsing
+
 - Search
+
 - Viewing
-- Limited manual correction
+
+- Light manual correction
 
 Contract:
-- Paperless documents link back to ledger IDs
-- Custom fields mirror ledger state
-- Business logic never lives in Paperless
 
-### Email Bundle Model
-- Email body → PDF (parent document)
-- Attachments → separate documents
-- Linked via Message-ID and Parent Document ID
+- Paperless stores `ledger_document_id`
+
+- Parent/child email bundles preserved
+
+- No business logic lives in Paperless
 
 ---
 
-## 9. Policies (Future-Proofing)
+## 10. Policies (Future)
 
 Policies answer questions like:
+
 - Which FX rate applies?
-- How is an expense allocated?
+
+- How is rent allocated?
+
+- How are late fees calculated?
+
 - How are retroactive changes handled?
 
-Rules:
-- Policies are **code modules**
-- YAML/JSON only selects and configures policies
-- Policies can be reapplied, reversed, versioned
+Policies:
 
-This enables changes in thinking **years later** without rebuilding.
+- are code modules
 
----
+- are selectable/configurable via YAML/JSON
 
-## 10. Reporting (XLSX)
-
-Characteristics:
-- Generated from state, not Paperless
-- Deterministic and fast
-- Clickable links to source documents
-- Regenerable at any time
-
-Supports:
-- Multiple entities
-- Multiple fiscal years
-- Cross-currency
-- Retroactive corrections
-- New report types without redesign
+- can be reapplied or reversed
 
 ---
 
-## 11. Query & Q&A Layer
+## 11. Reporting
+
+Reports:
+
+- are generated from ledger state
+
+- are deterministic
+
+- are regenerable
+
+- link back to source documents
+
+---
+
+## 12. Query & Q&A
 
 Capabilities:
-- Structured queries over ledger state
-- Embedding-backed semantic search (when needed)
-- Cited answers with confidence gating
 
-Trust Model:
-- If confidence is insufficient, system says so
-- Answers are explainable and traceable
+- Structured queries
+
+- Semantic search when needed
+
+- Confidence-gated answers
+
+- Full citation back to evidence
+
+If confidence is insufficient, the system must say so.
 
 ---
 
-## 12. Automation & Detectors
+## 13. Automation & Detectors
 
-Detectors observe extracted content and identify actionable situations.
+Detectors:
+
+- observe ledger state
+
+- identify actionable situations
 
 Examples:
-- School reminders
-- Payment deadlines
-- Compliance issues
-- Missing data
+
+- late rent
+
+- missing payments
+
+- upcoming deadlines
+
+- unreimbursed medical claims
 
 Actions:
-- Home Assistant notifications
-- Calendar events
-- Tasks
-- Review flags
 
-Detectors are optional plugins, not core logic.
+- notifications
 
----
+- emails
 
-## 13. Error Handling & Recovery
+- tasks
 
-Built-in requirements:
-- Structured error events
-- Retry queues
-- Partial success handling
-- Manual override paths
+- review flags
 
-No silent failures.
+Detectors are plugins, not core logic.
 
 ---
 
 ## 14. Performance Model
 
-- Runs at low priority during active use
-- Ramps up when idle
+- Low priority during active use
+
+- Scales up when idle
+
 - Chunked workloads
-- Safe to leave running continuously
+
+- Safe to run continuously
 
 ---
 
-## 15. Development Phases (Checklist)
+## 15. Development Phases
 
 ### Phase 1 — Ingestion Foundations ✅
-- Folder watcher
-- Gmail ingestion
-- Raw archiving
-- Event logging
 
-### Phase 2 — Email → Paperless (current)
-- Render email body to PDF
-- Upload email PDF
-- Upload attachments
-- Populate custom fields
-- Label cleanup
+### Phase 2 — Email → Paperless ✅
 
 ### Phase 3 — Ledger Integration
-- Document ↔ transaction linkage
+
+- Document identity & sidecars ✅ (locked)
+
+- Transaction linkage
+
 - Deduplication
-- Confidence scoring
+
+- Confidence handling
 
 ### Phase 4 — Policies
-- FX engine
-- Allocation engine
-- Retroactive reapplication
 
 ### Phase 5 — Reporting
-- XLSX generation
-- Real-time updates
-- New report definitions
 
 ### Phase 6 — Q&A
-- Structured query engine
-- Embeddings
-- Confidence gating
 
 ### Phase 7 — Automation
-- Detector framework
-- Home Assistant actions
-- Domain-specific rules
 
 ---
 
-## 16. Rules for All Future Work
+## 16. Rules for All Work
 
 - One step at a time
-- No re-answering solved questions
+
 - No silent assumptions
-- Prefer unused fields over rebuilds
+
 - Prefer reversibility over cleverness
-- Paperless is not the source of truth
+
+- Prefer unused fields over rebuilds
+
 - State is sacred
-- System must survive future changes in thinking
+
+- Paperless is not the source of truth
 
 ---
 
-## 17. Use of Codex (Implementation Accelerator)
+## 17. Chat ↔ Codex Workflow (Mandatory)
 
-DocSystem deliberately separates **system design** from **code generation**.
+**Chat**
 
-This project uses **two distinct execution modes**, each with a strict role.
+- Decides architecture
 
----
+- Locks contracts
 
-### 17.1 Roles and Responsibilities
+- Resolves ambiguity
 
-#### Chat (Architecture & Control Plane)
-Used for:
-- Defining architecture and data ownership
-- Locking contracts and invariants
-- Choosing policies (FX, allocation, confidence, retroactivity)
-- Identifying irreversible decisions
-- Evaluating future-proofing implications
-- Producing Codex-ready implementation briefs
+**Codex**
 
-Chat is the **architect, reviewer, and decision authority**.
+- Implements locked specs
 
-Chat must be used whenever:
-- A decision affects correctness, trust, or auditability
-- A choice cannot be easily reversed later
-- A new abstraction or policy is introduced
+- Produces full files
+
+- Makes no architectural decisions
+
+Skipping this split is disallowed.
 
 ---
 
-#### Codex (Execution Plane)
-Used for:
-- Implementing **already-locked specifications**
-- Writing full files (handlers, processors, reports)
-- Refactoring within frozen boundaries
-- Generating large, consistent code blocks
-- Implementing one phase or component at a time
-
-Codex is the **executor**.
-
-Codex must:
-- Follow the brief literally
-- Avoid inventing structure or assumptions
-- Avoid changing architecture
-- Avoid introducing new policies
-- Produce complete, runnable code (no placeholders, no TODOs)
-
----
-
-### 17.2 Mandatory Workflow
-
-For each development phase:
-
-1. **Chat**
-   - Confirm phase scope
-   - Resolve all ambiguity
-   - Lock behavior and contracts
-   - Produce a precise Codex brief
-
-2. **Codex**
-   - Implement exactly what is specified
-   - Generate full files
-   - No architectural changes
-
-3. **Chat**
-   - Review results
-   - Adjust design if needed
-   - Lock the next phase
-
-Skipping this workflow is explicitly disallowed.
-
----
-
-### 17.3 What Must NEVER Be Done in Codex
-
-Codex must not:
-- Choose defaults or policies
-- Guess user intent
-- Introduce new data ownership rules
-- Change the meaning of existing fields
-- Optimize in ways that reduce auditability
-- Collapse future flexibility for convenience
-
-If any of the above is required, return to **Chat** first.
-
----
-
-### 17.4 Design Principle
+## 18. Design Principle
 
 > **Chat decides what must never be wrong.  
 > Codex makes it fast.**
 
-This separation exists to ensure:
-- Long-term trust in outputs
-- Compliance safety
-- Reinterpretability of historical data
-- Survival of future changes in thinking
-
 ---
 
-### 17.5 Phase Suitability for Codex
+### ✅ READY STATE
 
-Safe to fully offload to Codex:
-- Handler implementations
-- Email/PDF rendering
-- CSV ingestion logic
-- Report generators (XLSX)
-- Detectors and actions (after contract is locked)
+This README now fully supports:
 
-Not safe to offload to Codex:
-- Architecture definition
-- Policy selection
-- Data model ownership decisions
-- Confidence and trust thresholds
+- leases
 
----
+- photos
 
-### 17.6 Instruction Contract
+- CSV feeds
 
-Any assistant working on DocSystem must:
-- Follow this Chat ↔ Codex split
-- Refuse to blur responsibilities
-- Prefer reversibility over cleverness
-- Prefer unused fields over rebuilds
-- Preserve auditability at all times
+- warranties
 
-Failure to follow this section invalidates the implementation.
+- reimbursements
+
+- automation
+
+- AI-assisted extraction
+
+- future unknown requirements
+
+without redesign.
