@@ -1,3 +1,15 @@
+# DocSystem (Canvas Source of Truth)
+
+**This canvas is now the single source of truth for the DocSystem spec.**
+
+- Repo `README.md` is a *rendered export* of this canvas.
+- All decisions/spec changes happen here first.
+- Exports back to the repo must be exact copies (no edits outside this canvas).
+
+---
+
+## Authoritative Spec (export target: `README.md`)
+
 # DocSystem
 
 **Local-first document, transaction, and automation system**  
@@ -49,43 +61,43 @@ without re-ingesting raw inputs.
 
 ## 3. Authoritative Folder Structure
 
-DocSystem/ 
+DocSystem/
 
-├── README.md                     ← this file 
+├── README.md                     ← this file
 
-├── data/ 
+├── data/
 
-│   └── ledger.sqlite3            ← authoritative structured state 
+│   └── ledger.sqlite3            ← authoritative structured state
 
-├── state/ 
+├── state/
 
-│   ├── events/               ← append-only JSONL event log 
+│   ├── events/               ← append-only JSONL event log
 
-│   ├── docs/                 ← document sidecars 
+│   ├── docs/                 ← document sidecars
 
-│   ├── txns/                 ← transaction sidecars 
+│   ├── txns/                 ← transaction sidecars
 
-│   ├── profiles/             ← import/source profiles 
+│   ├── profiles/             ← import/source profiles
 
-│   └── secrets/ 
+│   └── secrets/
 
-│       ├── ha_token.txt 
+│       ├── ha_token.txt
 
-│       ├── paperless_token.txt 
+│       ├── paperless_token.txt
 
-│       └── gmail/ 
+│       └── gmail/
 
-│           ├── client_secret.json 
+│           ├── client_secret.json
 
-│           └── token.json 
+│           └── token.json
 
-├── handlers/                 ← ingestion plugins 
+├── handlers/                 ← ingestion plugins
 
-├── policies/                 ← policy engines (future) 
+├── policies/                 ← policy engines (future)
 
-├── reports/                  ← report definitions 
+├── reports/                  ← report definitions
 
-├── outputs/                  ← generated XLSX outputs 
+├── outputs/                  ← generated XLSX outputs
 
 ├── Email-Archive/            ← archived raw .eml (YYYY/MM/)
 
@@ -542,3 +554,22 @@ This README now fully supports:
 - future unknown requirements
 
 without redesign.
+
+---
+
+## Change Log (Canvas-only)
+
+- 2026-01-28: Migrated spec authority to this canvas. `README.md` becomes an export target.
+
+## Active Work (Canvas-only)
+
+- Next: Phase 3.2 (Normalization & extraction timing + re-ingestion recovery behavior)
+
+## Export Checklist
+
+Before exporting to repo `README.md`:
+
+- Canvas changes are complete and internally consistent.
+- Export replaces the entire repo `README.md` content exactly.
+- Commit message references the phase/task driving the spec change.
+
