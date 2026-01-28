@@ -30,3 +30,6 @@ state/events/*.log
 docs/
 scripts/print_folders_tree.py
 migrations/0032_1_transactions.sql
+scripts/bind_entity_test.py
+scripts/inspect_inheritance_test.py
+scripts/probe_parent_children.py
