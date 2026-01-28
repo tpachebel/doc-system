@@ -1,8 +1,5 @@
-import json
-from pathlib import Path
-from typing import Any, Optional
-
 import requests
+from pathlib import Path
 
 BASE_URL = "https://docs.ragheb.ca"
 TOKEN_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\secrets\paperless_token.txt")
@@ -95,6 +92,35 @@ class PaperlessClient:
 
 		raise RuntimeError(f"Timeout waiting for task to produce document id. Last task payload: {last}")
 
+	def wait_for_task_document_id_and_status(self, task_id: str, timeout_seconds: int = 120):
+		import time
+
+		end = time.time() + timeout_seconds
+		last = None
+
+		while time.time() < end:
+			t = self.get_task(task_id)
+			last = t
+
+			if not t:
+				time.sleep(1)
+				continue
+
+			status = (t.get("status") or "").upper()
+			if status == "SUCCESS":
+				return int(t.get("related_document")), False
+
+			if status == "FAILURE":
+				rd = t.get("related_document")
+				result = (t.get("result") or "")
+				if rd and "duplicate" in str(result).lower():
+					return int(rd), True
+				raise RuntimeError(f"Task failed: {t}")
+
+			time.sleep(1)
+
+		raise RuntimeError(f"Timeout waiting for task. Last task payload: {last}")
+
 	def list_custom_fields(self):
 		url = f"{self.base_url}/api/custom_fields/"
 		resp = requests.get(url, headers=self.headers)
@@ -115,33 +141,20 @@ class PaperlessClient:
 				m[name.lower()] = int(cf["id"])
 		return m
 
-	def create_custom_field(self, name: str, data_type: str = "string"):
-		name = (name or "").strip()
-		if not name:
-			raise ValueError("Custom field name is empty")
-
-		url = f"{self.base_url}/api/custom_fields/"
-		payload = {
-			"name": name,
-			"data_type": data_type,
-			"extra_data": {"select_options": [], "default_currency": None},
-		}
-		resp = requests.post(url, headers={**self.headers, "Content-Type": "application/json"}, json=payload)
-		resp.raise_for_status()
-		return resp.json()
-
-	def ensure_custom_field(self, name: str, data_type: str = "string") -> int:
-		name_to_id = self._custom_field_name_to_id_map()
-		existing = name_to_id.get((name or "").strip().lower())
-		if existing:
-			return int(existing)
-		created = self.create_custom_field(name=name, data_type=data_type)
-		return int(created["id"])
-
 	def set_custom_fields_by_name(self, doc_id: int, values_by_name: dict):
+		# IMPORTANT: merge (do not wipe other existing fields)
 		name_to_id = self._custom_field_name_to_id_map()
-		items = []
-		for k, v in values_by_name.items():
+
+		doc = self.get_document(doc_id)
+		existing = {}
+		for cf in (doc.get("custom_fields") or []):
+			try:
+				fid = int(cf.get("field"))
+			except Exception:
+				continue
+			existing[fid] = cf.get("value")
+
+		for k, v in (values_by_name or {}).items():
 			if v is None:
 				continue
 			if isinstance(v, str) and not v.strip():
@@ -149,8 +162,10 @@ class PaperlessClient:
 			key = str(k).strip().lower()
 			if key not in name_to_id:
 				raise RuntimeError(f"Paperless custom field not found: {k}")
-			field_id = name_to_id[key]
-			items.append({"field": field_id, "value": v})
+			fid = int(name_to_id[key])
+			existing[fid] = v
+
+		items = [{"field": fid, "value": val} for fid, val in existing.items()]
 
 		url = f"{self.base_url}/api/documents/{doc_id}/"
 		payload = {"custom_fields": items}
@@ -205,101 +220,116 @@ class PaperlessClient:
 		resp.raise_for_status()
 		return resp.json()
 
-	def find_document_by_custom_field(self, field_name: str, exact_value: str):
-		exact_value = (exact_value or "").strip()
-		if not exact_value:
+	def find_document_by_custom_field_exact(self, field_id, value):
+		page = 1
+
+		while True:
+			params = {
+				"page": page,
+				"page_size": 100,
+				"ordering": "-created",
+			}
+
+			resp = self._get("/api/documents/", params=params)
+
+			results = resp.get("results", [])
+			if not results:
+				return None
+
+			for doc in results:
+				for cf in doc.get("custom_fields", []):
+					if cf.get("field") == field_id and cf.get("value") == value:
+						return doc
+
+			if not resp.get("next"):
+				return None
+
+			page += 1
+
+	def _norm_rfc_message_id(self, rfc_message_id: str) -> str:
+		s = str(rfc_message_id or "").strip()
+		if not s:
+			return ""
+		s = s.strip()
+		if s.startswith("<") and s.endswith(">"):
+			s = s[1:-1].strip()
+		return s
+
+	def find_email_parent_by_identity_key(self, identity_key: str):
+		identity_key = (identity_key or "").strip()
+		if not identity_key:
 			return None
 
-		data = self.get_documents(params={"page_size": 50, "ordering": "-added"})
-		items = []
-		if isinstance(data, dict) and "results" in data:
-			items = data["results"]
-		elif isinstance(data, list):
-			items = data
+		email_parent_tag_id = self.ensure_tag_id("email-parent")
 
 		name_to_id = self._custom_field_name_to_id_map()
-		fid = name_to_id.get((field_name or "").strip().lower())
-		if not fid:
+		fid_msgid = name_to_id.get("email message-id")
+		fid_is_parent = name_to_id.get("email is parent")
+		if not fid_msgid or not fid_is_parent:
 			return None
 
-		target = exact_value
-		for d in items:
-			for cf in (d.get("custom_fields") or []):
-				if int(cf.get("field", -1)) == int(fid) and str(cf.get("value", "")).strip() == target:
-					return d
-		return None
-
-	def find_document_by_custom_field_exact(self, field_name: str, exact_value: str) -> Optional[dict]:
-		exact_value = (exact_value or "").strip()
-		if not exact_value:
-			return None
-
-		params = {
-			"custom_field_query": json.dumps([field_name, "exact", exact_value]),
-			"page_size": 1
-		}
-
-		url = f"{self.base_url}/api/documents/"
-		try:
-			resp = requests.get(url, headers=self.headers, params=params)
-			if resp.status_code == 400:
-				return self.find_document_by_custom_field(field_name, exact_value)
-			resp.raise_for_status()
-			data = resp.json()
+		page = 1
+		while True:
+			data = self.get_documents(params={"page": page, "page_size": 100, "ordering": "-added"})
 			items = data.get("results", []) if isinstance(data, dict) else (data or [])
-			if items:
-				return items[0]
-			return None
-		except requests.RequestException:
-			return self.find_document_by_custom_field(field_name, exact_value)
+			if not items:
+				return None
 
-	def build_email_identity_key(self, gmail_account_email: str, rfc_message_id: str) -> str:
-		return f"{(gmail_account_email or '').strip().lower()}::{(rfc_message_id or '').strip()}"
+			for d in items:
+				tags = d.get("tags") or []
+				if email_parent_tag_id not in tags:
+					continue
 
-	def find_or_lock_email_parent(self, gmail_account_email: str, rfc_message_id: str) -> dict[str, Any]:
-		rfc_message_id = (rfc_message_id or "").strip()
-		if not rfc_message_id:
-			return {"document": None, "identity_key": None, "matched": "none"}
+				has_msgid = False
+				has_is_parent = False
 
-		identity_key = self.build_email_identity_key(gmail_account_email, rfc_message_id)
+				for cf in (d.get("custom_fields") or []):
+					if int(cf.get("field", -1)) == int(fid_msgid) and str(cf.get("value", "")).strip() == identity_key:
+						has_msgid = True
 
-		d = self.find_document_by_custom_field_exact("Email Message-ID", identity_key)
-		if d:
-			return {"document": d, "identity_key": identity_key, "matched": "composite"}
+					if int(cf.get("field", -1)) == int(fid_is_parent):
+						v = cf.get("value")
+						if v is True or str(v).strip().lower() in ("true", "1", "yes"):
+							has_is_parent = True
 
-		legacy = self.find_document_by_custom_field_exact("Email Message-ID", rfc_message_id)
-		if legacy:
-			self.set_custom_fields_by_name(int(legacy["id"]), {"Email Message-ID": identity_key})
-			legacy = self.get_document(int(legacy["id"]))
-			return {"document": legacy, "identity_key": identity_key, "matched": "legacy"}
+				if has_msgid and has_is_parent:
+					return d
 
-		return {"document": None, "identity_key": identity_key, "matched": "none"}
-
-	def wait_for_task_document_id_and_status(self, task_id: str, timeout_seconds: int = 120):
-		import time
-
-		end = time.time() + timeout_seconds
-		last = None
-
-		while time.time() < end:
-			t = self.get_task(task_id)
-			last = t
-
-			if not t:
-				time.sleep(1)
+			if isinstance(data, dict) and data.get("next"):
+				page += 1
 				continue
 
-			status = (t.get("status") or "").upper()
-			if status == "SUCCESS":
-				return int(t.get("related_document")), False
+			return None
 
-			if status == "FAILURE":
-				rd = t.get("related_document")
-				result = (t.get("result") or "")
-				if rd and "duplicate" in str(result).lower():
-					return int(rd), True
-				raise RuntimeError(f"Task failed: {t}")
+	def find_or_lock_email_parent(self, gmail_account_email: str, rfc_message_id: str):
+		# Returns:
+		# {
+		#   "identity_key": "<gmail>::<rfc>",
+		#   "matched": "composite" | "legacy" | "none",
+		#   "document": {..} | None
+		# }
+		acct = str(gmail_account_email or "").strip().lower()
+		rfc = self._norm_rfc_message_id(rfc_message_id)
+		if not acct or not rfc:
+			return {"identity_key": "", "matched": "none", "document": None}
 
-			time.sleep(1)
+		identity_key = f"{acct}::<{rfc}>"
 
-		raise RuntimeError(f"Timeout waiting for task. Last task payload: {last}")
+		# 1) Composite match (hard lock)
+		doc = self.find_email_parent_by_identity_key(identity_key)
+		if doc:
+			return {"identity_key": identity_key, "matched": "composite", "document": doc}
+
+		# 2) Legacy match: older runs may have stored raw RFC Message-ID only (with or without <>)
+		legacy_a = rfc
+		legacy_b = f"<{rfc}>"
+
+		doc_legacy = self.find_email_parent_by_identity_key(legacy_a) or self.find_email_parent_by_identity_key(legacy_b)
+		if doc_legacy:
+			# Migrate in-place to composite key (non-destructive merge)
+			# No silent failures: if migration fails, raise so the caller logs and retries.
+			self.set_custom_fields_by_name(int(doc_legacy["id"]), {"Email Message-ID": identity_key, "Email Is Parent": True})
+			self.set_tags_by_name(int(doc_legacy["id"]), ["email", "email-parent"])
+			return {"identity_key": identity_key, "matched": "legacy", "document": doc_legacy}
+
+		return {"identity_key": identity_key, "matched": "none", "document": None}

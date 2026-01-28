@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-EVENT_LOG_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\ingest_events.jsonl")
+EVENT_LOG_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\events\ingest_events.jsonl")
 
 def main():
 	if not EVENT_LOG_PATH.exists():

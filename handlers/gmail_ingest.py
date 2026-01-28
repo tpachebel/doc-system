@@ -23,7 +23,7 @@ from handlers.gmail_config import SCOPES, TOKEN_PATH, LABEL_NAME, MAX_MESSAGES_P
 
 EMAIL_ARCHIVE_ROOT = Path(r"C:\Users\tragh\Nextcloud\DocSystem\Email-Archive")
 ATTACH_DB = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\attachment_dedupe.sqlite3")
-EVENT_LOG_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\ingest_events.jsonl")
+EVENT_LOG_PATH = Path(r"C:\Users\tragh\Nextcloud\DocSystem\state\events\ingest_events.jsonl")
 
 
 def _utc_now_iso() -> str:
@@ -204,6 +204,24 @@ def _find_existing_attachment_legacy(pl: PaperlessClient, locked_key: str, fname
 	return best_id
 
 
+def _paperless_is_attachment_doc(pl: PaperlessClient, doc_id: int) -> bool:
+	try:
+		d = pl.get_document(int(doc_id))
+	except Exception:
+		return False
+
+	# Strong signal: Email Is Parent == False
+	for cf in (d.get("custom_fields") or []):
+		if str(cf.get("field")) and str(cf.get("value")).strip().lower() in ("false", "0", "no"):
+			# Not safe to key off unknown field IDs here; we just use this as a best-effort.
+			pass
+
+	# Safer: check tags by name via IDs is hard here; instead inspect title/original filename heuristics is weak.
+	# Best practical: attachment docs should have parent set (after you add set_parent later).
+	# For now: reject if it has email-parent tag implicitly by being the parent doc in this run.
+	return True
+
+
 def main():
 	service = _gmail_service()
 	gmail_account_email = _get_gmail_account_email(service)
@@ -223,29 +241,9 @@ def main():
 	cur = db.cursor()
 
 	for gmail_mid in msg_ids:
-		if log.has_ingest_completed(gmail_account_email, gmail_mid):
-			try:
-				_remove_label(service, gmail_mid, label_id)
-				if not log.has_label_removed(gmail_account_email, gmail_mid):
-					log.append({
-						"event_type": "label_removed",
-						"ts_utc": _utc_now_iso(),
-						"gmail_account": gmail_account_email,
-						"gmail_message_id": gmail_mid,
-						"note": "late_remove_after_skip",
-					})
-				print(f"Label removed (skip-path): {gmail_mid}")
-			except Exception as e:
-				log.append({
-					"event_type": "label_remove_failed",
-					"ts_utc": _utc_now_iso(),
-					"gmail_account": gmail_account_email,
-					"gmail_message_id": gmail_mid,
-					"error": repr(e),
-					"note": "skip_path",
-				})
-			print(f"Skipped already-ingested message: {gmail_mid}")
-			continue
+		reconcile_mode = log.has_ingest_completed(gmail_account_email, gmail_mid)
+		if reconcile_mode:
+			print(f"Reconcile mode: {gmail_mid} (already ingested; will repair Paperless state if needed)")
 
 		event_id = str(uuid.uuid4())
 		attachments_events = []
@@ -332,18 +330,43 @@ def main():
 				row = cur.execute("SELECT document_id FROM attachment_hash WHERE sha256=?", (h,)).fetchone()
 				if row:
 					doc_id = int(row[0])
-					if _paperless_doc_exists(pl, doc_id):
-						attachments_events.append({
-							"filename": fname,
-							"sha256": h,
-							"doc_id": doc_id,
-							"action": "reused_sqlite",
-						})
-						print(f"Attachment reused (sqlite): {fname} -> doc {doc_id}")
-						continue
 
-					cur.execute("DELETE FROM attachment_hash WHERE sha256=?", (h,))
-					print(f"Attachment stale (sqlite purged): {fname} -> missing doc {doc_id}")
+					# Reject mappings that point to the email parent doc for this run.
+					if int(doc_id) == int(parent_id):
+						cur.execute("DELETE FROM attachment_hash WHERE sha256=?", (h,))
+						print(f"Attachment stale (sqlite purged): {fname} -> mapped to parent doc {doc_id}")
+					else:
+						if _paperless_doc_exists(pl, doc_id):
+							# Ensure Paperless has the hash too (so dedupe survives sqlite loss)
+							try:
+								pl.set_custom_fields_by_name(doc_id, {"Email Attachment SHA256": h})
+							except Exception as e:
+								log.append({
+									"event_type": "paperless_repair_failed",
+									"event_id": event_id,
+									"ts_utc": _utc_now_iso(),
+									"gmail_account": gmail_account_email,
+									"gmail_message_id": gmail_mid,
+									"doc_id": int(doc_id),
+									"action": "set_custom_field",
+									"field_name": "Email Attachment SHA256",
+									"value": h,
+									"error": repr(e),
+								})
+								raise
+
+							attachments_events.append({
+								"filename": fname,
+								"sha256": h,
+								"doc_id": doc_id,
+								"action": "reused_sqlite",
+							})
+							print(f"Attachment reused (sqlite): {fname} -> doc {doc_id}")
+							pl.set_custom_fields_by_name(doc_id, {"Email Parent Doc ID": parent_id})
+							continue
+
+						cur.execute("DELETE FROM attachment_hash WHERE sha256=?", (h,))
+						print(f"Attachment stale (sqlite purged): {fname} -> missing doc {doc_id}")
 
 				existing = pl.find_document_by_custom_field_exact("Email Attachment SHA256", h)
 				if existing:
@@ -431,6 +454,7 @@ def main():
 				**email_meta,
 				**parent_event,
 				"attachments": attachments_events,
+				"run_mode": "reconcile" if reconcile_mode else "ingest",
 			})
 
 			_remove_label(service, gmail_mid, label_id)
